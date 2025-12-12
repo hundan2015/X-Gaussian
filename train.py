@@ -16,11 +16,12 @@ import time
 import yaml
 
 from pdb import set_trace as stx
-
-PURE_T
-
+import csv
+START_TRAINING_TIME = time.time()
+PURE_TRAINING_TIME = 0.0
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+    testing_iterations.append(opt.iterations)
     first_iter = 0
     exp_logger = prepare_output_and_logger(dataset)
     exp_logger.info("Training parameters: {}".format(vars(opt)))
@@ -37,6 +38,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
+    optimize_start = torch.cuda.Event(enable_timing = True)
+    optimize_end = torch.cuda.Event(enable_timing = True)
+    global PURE_TRAINING_TIME
+    PURE_TRAINING_TIME = 0.0
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -74,7 +79,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss.backward()
 
         iter_end.record()
-
+        torch.cuda.synchronize()
+        PURE_TRAINING_TIME += iter_start.elapsed_time(iter_end)
 
         with torch.no_grad():
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -90,6 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 exp_logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
+            optimize_start.record()
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
@@ -97,13 +104,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
+
+            optimize_end.record()
+            torch.cuda.synchronize()
+            PURE_TRAINING_TIME += optimize_start.elapsed_time(optimize_end)
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -142,7 +153,10 @@ def training_report(exp_logger, iteration, Ll1, loss, l1_loss, elapsed, testing_
             if config['cameras'] and len(config['cameras']) > 0 and config['name'] == 'test':
                 psnr_test = 0.0
                 ssim_test = 0.0
+                pred_start = torch.cuda.Event(enable_timing = True)
+                pred_end = torch.cuda.Event(enable_timing = True)
                 start = time.time()
+                pred_start.record()
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     image_backnorm = (viewpoint.max_value - viewpoint.min_value) * image + viewpoint.min_value
@@ -155,6 +169,8 @@ def training_report(exp_logger, iteration, Ll1, loss, l1_loss, elapsed, testing_
 
                     ssim_test += ssim(image_backnorm, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image_norm).mean().double()
+                pred_end.record()
+                torch.cuda.synchronize()
 
                 psnr_test /= len(config['cameras'])
                 ssim_test /= len(config['cameras'])
@@ -163,6 +179,42 @@ def training_report(exp_logger, iteration, Ll1, loss, l1_loss, elapsed, testing_
                 exp_logger.info(f"Testing Speed: {len(config['cameras'])/(end-start)} fps")
                 exp_logger.info(f"Testing Time: {end-start} s")
                 exp_logger.info("\n[ITER {}] Evaluating {}: SSIM = {}, PSNR = {}".format(iteration, config['name'], ssim_test, psnr_test))
+
+                csv_path = os.path.join(scene.model_path, "metrics_3d.csv")
+                global PURE_TRAINING_TIME
+                fields = [
+                    "iteration",
+                    "split",
+                    "num_cameras",
+                    "gaussian_count",
+                    "model_vram",
+                    "psnr",
+                    "ssim",
+                    "pred_time",
+                    "pure_training_time",
+                    "total_training_time",
+                ]
+
+                row = {
+                    "iteration": iteration,
+                    "split": config["name"],
+                    "num_cameras": len(config["cameras"]),
+                    "gaussian_count": len(scene.gaussians.get_xyz),
+                    "model_vram": scene.gaussians.model_vram,
+                    "psnr": float(psnr_test),
+                    "ssim": float(ssim_test),
+                    "pred_time": pred_start.elapsed_time(pred_end),
+                    "pure_training_time": float(PURE_TRAINING_TIME),
+                    "total_training_time": float(time.time() - START_TRAINING_TIME),
+                }
+
+                os.makedirs(scene.model_path, exist_ok=True)
+                file_exists = os.path.isfile(csv_path)
+                with open(csv_path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fields)
+                    if not file_exists:
+                        writer.writeheader()
+                    writer.writerow(row)
 
         if exp_logger:
             exp_logger.info(f'Iter:{iteration}, total_points:{scene.gaussians.get_xyz.shape[0]}')
@@ -199,11 +251,11 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    # with open(args.config, 'r') as f:
+    #     config = yaml.safe_load(f)
     
-    for key, value in config.items():
-        setattr(args, key, value)
+    # for key, value in config.items():
+    #     setattr(args, key, value)
 
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
 

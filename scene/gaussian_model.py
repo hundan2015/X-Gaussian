@@ -214,6 +214,18 @@ class GaussianModel_Xray:
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
+    @property
+    def model_vram(self):
+        xyz = self._xyz.nbytes
+        normals = np.zeros_like(xyz).nbytes
+        f_dc = self._features_dc.nbytes
+        f_rest = self._features_rest.nbytes
+        opacities = self._opacity.nbytes
+        scale = self._scaling.nbytes
+        rotation = self._rotation.nbytes
+
+        result = xyz + normals + f_dc + f_rest + opacities + scale + rotation
+        return result
 
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
