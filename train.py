@@ -17,6 +17,8 @@ import yaml
 
 from pdb import set_trace as stx
 
+PURE_T
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
