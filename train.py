@@ -237,12 +237,10 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--gpu_id", default="0", help="gpu to use")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
     os.environ["CUDA_DEVICE_ORDER"] = 'PCI_BUS_ID'
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
     print("Optimizing " + args.model_path)
 
