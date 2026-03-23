@@ -223,7 +223,7 @@ def example_usage():
             "--source_path",
             pickle_file,
             "--iterations",
-            "20",
+            "20000",
             "--model_path",
             f"{output_dir}",
             "--eval",
