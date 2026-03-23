@@ -19,7 +19,7 @@ from pdb import set_trace as stx
 class ConeGeometry(object):
     def __init__(self, data):
 
-        scale = 1.0
+        scale = 1000.0
 
         self.DSD = data["DSD"]/scale 
         self.DSO = data["DSO"]/scale
