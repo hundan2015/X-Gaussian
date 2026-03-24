@@ -8,6 +8,7 @@ from pathlib import Path
 
 import imageio.v2 as iio
 import numpy as np
+from skimage.metrics import structural_similarity
 
 try:
     from tigre.utilities.geometry import Geometry
@@ -179,9 +180,9 @@ def robust_normalize(volume, low_q=0.01, high_q=0.995):
     lo = float(np.quantile(v, low_q))
     hi = float(np.quantile(v, high_q))
     if hi <= lo:
-        return np.zeros_like(v, dtype=np.float32), lo, hi
+        return np.zeros_like(v, dtype=np.float32)
     v = (v - lo) / (hi - lo)
-    return np.clip(v, 0.0, 1.0), lo, hi
+    return np.clip(v, 0.0, 1.0)
 
 
 def get_psnr_3d(pred, gt, eps=1e-12):
@@ -193,11 +194,72 @@ def get_psnr_3d(pred, gt, eps=1e-12):
     return float(20.0 * np.log10(1.0 / np.sqrt(mse + eps)))
 
 
-def update_metrics_3d_csv(model_path, psnr_3d, asd_pocs_time):
+def get_ssim_3d(arr1, arr2, size_average=True, pixel_max=1.0):
+    """
+    SAX-NeRF style 3D SSIM: compute SSIM on D/H/W axis views and average.
+    Expected input shape is [D, H, W] in [0, 1].
+    """
+    arr1 = np.asarray(arr1)
+    arr2 = np.asarray(arr2)
+    arr1 = arr1[np.newaxis, ...]
+    arr2 = arr2[np.newaxis, ...]
+
+    if not ((arr1.ndim == 4) and (arr2.ndim == 4)):
+        raise ValueError(f"Expected [N, D, H, W], got {arr1.shape} and {arr2.shape}")
+
+    arr1 = arr1.astype(np.float64)
+    arr2 = arr2.astype(np.float64)
+    n = arr1.shape[0]
+
+    arr1_d = np.transpose(arr1, (0, 2, 3, 1))
+    arr2_d = np.transpose(arr2, (0, 2, 3, 1))
+    ssim_d = np.asarray(
+        [
+            structural_similarity(arr1_d[i], arr2_d[i], data_range=pixel_max)
+            for i in range(n)
+        ],
+        dtype=np.float64,
+    )
+
+    arr1_h = np.transpose(arr1, (0, 1, 3, 2))
+    arr2_h = np.transpose(arr2, (0, 1, 3, 2))
+    ssim_h = np.asarray(
+        [
+            structural_similarity(arr1_h[i], arr2_h[i], data_range=pixel_max)
+            for i in range(n)
+        ],
+        dtype=np.float64,
+    )
+
+    ssim_w = np.asarray(
+        [
+            structural_similarity(arr1[i], arr2[i], data_range=pixel_max)
+            for i in range(n)
+        ],
+        dtype=np.float64,
+    )
+
+    ssim_avg = (ssim_d + ssim_h + ssim_w) / 3.0
+    if size_average:
+        return float(ssim_avg.mean())
+    return ssim_avg
+
+
+def load_npy_volume(path, name):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Missing {name} file: {p}")
+    arr = np.load(p)
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D volume for {name}, got shape {arr.shape} from {p}")
+    return arr.astype(np.float32)
+
+
+def update_metrics_3d_csv(model_path, psnr_3d, ssim_3d, asd_pocs_time):
     """
     If metrics_3d.csv exists, create metrics_3d_new.csv with the header and last row,
-    replacing the psnr column with the newly computed psnr_3d value and pred_time with
-    original pred_time + asd_pocs_time.
+    replacing legacy psnr/ssim columns with newly computed 3D values, adding explicit
+    psnr_3d/ssim_3d columns, and updating pred_time as original pred_time + asd_pocs_time.
     """
     metrics_csv = Path(model_path) / "metrics_3d.csv"
     if not metrics_csv.exists():
@@ -212,12 +274,26 @@ def update_metrics_3d_csv(model_path, psnr_3d, asd_pocs_time):
             return None
 
         # Get header and last row
-        fieldnames = reader.fieldnames
+        fieldnames = list(reader.fieldnames or [])
         last_row = rows[-1]
 
         # Update psnr column with new psnr_3d value
         if "psnr" in fieldnames and psnr_3d is not None:
             last_row["psnr"] = str(psnr_3d)
+
+        # Update ssim column with new ssim_3d value
+        if "ssim" in fieldnames and ssim_3d is not None:
+            last_row["ssim"] = str(ssim_3d)
+
+        # # Also write explicit 3D metric columns to avoid ambiguity with 2D metrics.
+        # if "psnr_3d" not in fieldnames:
+        #     fieldnames.append("psnr_3d")
+        # if "ssim_3d" not in fieldnames:
+        #     fieldnames.append("ssim_3d")
+        # if psnr_3d is not None:
+        #     last_row["psnr_3d"] = str(psnr_3d)
+        # if ssim_3d is not None:
+        #     last_row["ssim_3d"] = str(ssim_3d)
 
         # Update pred_time: original pred_time + asd_pocs_time
         if "pred_time" in fieldnames and asd_pocs_time is not None:
@@ -236,7 +312,7 @@ def update_metrics_3d_csv(model_path, psnr_3d, asd_pocs_time):
             writer.writeheader()
             writer.writerow(last_row)
 
-        print(f"[INFO] Created metrics_3d_new.csv with updated psnr_3d and pred_time values")
+        print(f"[INFO] Created metrics_3d_new.csv with updated psnr_3d/ssim_3d and pred_time values")
         return metrics_csv_new
 
     except Exception as e:
@@ -269,46 +345,10 @@ def export_slices(volume_norm, output_dir, low_q, high_q, prefix):
         iio.imwrite(root_l / f"{prefix}_{i:03d}.png", window_to_uint8(volume_norm[:, :, k], lo, hi))
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Reconstruct 3D volume via TIGRE ASD-POCS from an X-Gaussian run directory and export 256 slices."
-    )
-    parser.add_argument("--model_path", required=True, type=str, help="X-Gaussian output run directory")
-    parser.add_argument(
-        "--source_pickle",
-        default=None,
-        type=str,
-        help="Optional source pickle path; if omitted, parse from model_path/cfg_args",
-    )
-    parser.add_argument("--output_dir", default=None, type=str, help="Output directory")
-    parser.add_argument("--nview", default=100, type=int, help="Number of train projections used")
-    parser.add_argument(
-        "--projection_source",
-        default="model_test_renders",
-        choices=[
-            "pickle_train",
-            "pickle_val",
-            "model_test_renders",
-            "model_train_renders",
-        ],
-        help="Input projection source for ASD-POCS",
-    )
-    parser.add_argument("--niter", default=6, type=int, help="ASD-POCS iterations")
-    parser.add_argument("--lmbda", default=1.0, type=float, help="ASD-POCS lambda")
-    parser.add_argument("--lmbda_red", default=0.999, type=float, help="ASD-POCS lambda reduction")
-    parser.add_argument("--init", default=None, type=str, help="ASD-POCS init mode")
-    parser.add_argument("--verbose", action="store_true", help="Verbose TIGRE solver output")
-    parser.add_argument("--low_q", default=0.01, type=float, help="Low quantile for normalization")
-    parser.add_argument("--high_q", default=0.995, type=float, help="High quantile for normalization")
-    args = parser.parse_args()
-
-    model_path = Path(args.model_path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model directory not found: {model_path}")
-
-    source_pickle = args.source_pickle
+def resolve_source_pickle(model_path, source_pickle_arg):
+    source_pickle = source_pickle_arg
     if source_pickle is None:
-        cfg_args = model_path / "cfg_args"
+        cfg_args = Path(model_path) / "cfg_args"
         if not cfg_args.exists():
             raise FileNotFoundError(
                 "Cannot resolve source pickle: missing cfg_args and no --source_pickle provided."
@@ -321,9 +361,11 @@ def main():
     source_pickle = Path(source_pickle)
     if not source_pickle.exists():
         raise FileNotFoundError(f"Source pickle not found: {source_pickle}")
+    return source_pickle
 
-    out_dir = Path(args.output_dir) if args.output_dir else model_path / "recon_tigre_asd_pocs"
-    out_dir.mkdir(parents=True, exist_ok=True)
+
+def reconstruct_pred_gt(args, model_path, out_dir):
+    source_pickle = resolve_source_pickle(model_path, args.source_pickle)
 
     with open(source_pickle, "rb") as f:
         data = pickle.load(f)
@@ -370,38 +412,146 @@ def main():
 
     image_pred = orient_like_sax_nerf(np.asarray(image_pred, dtype=np.float32))
     image_pred = maybe_resample_to_256(image_pred)
-
-    pred_norm, pred_lo, pred_hi = robust_normalize(image_pred, args.low_q, args.high_q)
+    pred_norm = robust_normalize(image_pred, args.low_q, args.high_q)
     np.save(out_dir / "image_pred.npy", pred_norm.astype(np.float32))
     export_slices(pred_norm, out_dir, args.low_q, args.high_q, prefix="ct_pred")
 
+    gt_norm = None
     if dset.gt_image is not None:
         image_gt = maybe_resample_to_256(np.asarray(dset.gt_image, dtype=np.float32))
-        gt_norm, gt_lo, gt_hi = robust_normalize(image_gt, args.low_q, args.high_q)
+        gt_norm = robust_normalize(image_gt, args.low_q, args.high_q)
         np.save(out_dir / "image_gt.npy", gt_norm.astype(np.float32))
         export_slices(gt_norm, out_dir, args.low_q, args.high_q, prefix="ct_gt")
-        psnr_3d = get_psnr_3d(pred_norm, gt_norm)
+
+    return {
+        "pred_eval": pred_norm,
+        "gt_eval": gt_norm,
+        "source_pickle": source_pickle,
+        "view_num": view_num,
+        "asd_pocs_time": asd_pocs_time,
+    }
+
+
+def load_cached_pred_gt(args, out_dir, model_path):
+    pred_path = Path(args.pred_npy) if args.pred_npy else out_dir / "image_pred.npy"
+    gt_path = Path(args.gt_npy) if args.gt_npy else out_dir / "image_gt.npy"
+
+    print(f"[INFO] model_path: {model_path}")
+    print("[INFO] mode: eval_only (skip reconstruction)")
+    print(f"[INFO] pred_npy: {pred_path}")
+    print(f"[INFO] gt_npy: {gt_path}")
+
+    pred_eval = load_npy_volume(pred_path, "pred")
+    gt_eval = load_npy_volume(gt_path, "gt")
+    if pred_eval.shape != gt_eval.shape:
+        raise ValueError(
+            f"Shape mismatch: pred {pred_eval.shape} vs gt {gt_eval.shape}. "
+            "Please provide aligned cached volumes."
+        )
+
+    return {
+        "pred_eval": pred_eval,
+        "gt_eval": gt_eval,
+        "source_pickle": None,
+        "view_num": 0,
+        "asd_pocs_time": None,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reconstruct 3D volume via TIGRE ASD-POCS from an X-Gaussian run directory and export 256 slices."
+    )
+    parser.add_argument("--model_path", required=True, type=str, help="X-Gaussian output run directory")
+    parser.add_argument(
+        "--source_pickle",
+        default=None,
+        type=str,
+        help="Optional source pickle path; if omitted, parse from model_path/cfg_args",
+    )
+    parser.add_argument("--output_dir", default=None, type=str, help="Output directory")
+    parser.add_argument("--nview", default=100, type=int, help="Number of train projections used")
+    parser.add_argument(
+        "--projection_source",
+        default="model_test_renders",
+        choices=[
+            "pickle_train",
+            "pickle_val",
+            "model_test_renders",
+            "model_train_renders",
+        ],
+        help="Input projection source for ASD-POCS",
+    )
+    parser.add_argument("--niter", default=6, type=int, help="ASD-POCS iterations")
+    parser.add_argument("--lmbda", default=1.0, type=float, help="ASD-POCS lambda")
+    parser.add_argument("--lmbda_red", default=0.999, type=float, help="ASD-POCS lambda reduction")
+    parser.add_argument("--init", default=None, type=str, help="ASD-POCS init mode")
+    parser.add_argument("--verbose", action="store_true", help="Verbose TIGRE solver output")
+    parser.add_argument("--low_q", default=0.01, type=float, help="Low quantile for normalization")
+    parser.add_argument("--high_q", default=0.995, type=float, help="High quantile for normalization")
+    parser.add_argument(
+        "--skip_recon",
+        action="store_true",
+        help="Skip reconstruction and evaluate PSNR/SSIM directly from existing image_pred/image_gt npy files",
+    )
+    parser.add_argument(
+        "--pred_npy",
+        default=None,
+        type=str,
+        help="Optional path to predicted 3D npy file (defaults to output_dir/image_pred.npy)",
+    )
+    parser.add_argument(
+        "--gt_npy",
+        default=None,
+        type=str,
+        help="Optional path to GT 3D npy file (defaults to output_dir/image_gt.npy)",
+    )
+    args = parser.parse_args()
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model directory not found: {model_path}")
+
+    out_dir = Path(args.output_dir) if args.output_dir else model_path / "recon_tigre_asd_pocs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.skip_recon:
+        stage = load_cached_pred_gt(args, out_dir, model_path)
     else:
-        gt_lo, gt_hi = None, None
-        psnr_3d = None
+        stage = reconstruct_pred_gt(args, model_path, out_dir)
+
+    pred_eval = stage["pred_eval"]
+    gt_eval = stage["gt_eval"]
+    source_pickle = stage["source_pickle"]
+    view_num = stage["view_num"]
+    asd_pocs_time = stage["asd_pocs_time"]
+
+    psnr_3d = None
+    ssim_3d = None
+    if gt_eval is not None:
+        psnr_3d = get_psnr_3d(pred_eval, gt_eval)
+        ssim_3d = get_ssim_3d(pred_eval, gt_eval)
 
     metrics = {
         "algorithm": "tigre.asd_pocs",
+        "mode": "eval_only" if args.skip_recon else "recon_and_eval",
         "nview": int(view_num),
         "niter": int(args.niter),
         "lmbda": float(args.lmbda),
         "lmbda_red": float(args.lmbda_red),
         "psnr_3d": psnr_3d,
+        "ssim_3d": ssim_3d,
     }
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)
 
     # Update metrics_3d.csv if it exists
     if psnr_3d is not None:
-        update_metrics_3d_csv(model_path, psnr_3d, asd_pocs_time)
+        update_metrics_3d_csv(model_path, psnr_3d, ssim_3d, asd_pocs_time)
 
     with open(out_dir / "meta.txt", "w", encoding="utf-8") as f:
         f.write(f"model_path: {model_path}\n")
+        f.write(f"mode: {'eval_only' if args.skip_recon else 'recon_and_eval'}\n")
         f.write(f"source_pickle: {source_pickle}\n")
         f.write("algorithm: tigre.asd_pocs\n")
         f.write(f"nview: {view_num}\n")
@@ -410,15 +560,16 @@ def main():
         f.write(f"lmbda: {args.lmbda}\n")
         f.write(f"lmbda_red: {args.lmbda_red}\n")
         f.write(f"init: {args.init}\n")
-        f.write(f"pred_window_lo: {pred_lo}\n")
-        f.write(f"pred_window_hi: {pred_hi}\n")
-        f.write(f"gt_window_lo: {gt_lo}\n")
-        f.write(f"gt_window_hi: {gt_hi}\n")
         f.write(f"psnr_3d: {psnr_3d}\n")
+        f.write(f"ssim_3d: {ssim_3d}\n")
 
-    print(f"[DONE] Saved TIGRE ASD-POCS reconstruction to: {out_dir}")
+    if args.skip_recon:
+        print(f"[DONE] Evaluated cached volumes from: {out_dir}")
+    else:
+        print(f"[DONE] Saved TIGRE ASD-POCS reconstruction to: {out_dir}")
     if psnr_3d is not None:
         print(f"[METRIC] PSNR_3D: {psnr_3d:.6f}")
+        print(f"[METRIC] SSIM_3D: {ssim_3d:.6f}")
 
 
 if __name__ == "__main__":
